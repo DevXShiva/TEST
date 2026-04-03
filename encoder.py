@@ -2,29 +2,30 @@ import asyncio
 import os
 
 async def encode_m3u8(url, output_path):
-    """
-    Ultra-fast transcoding optimized for Telegram.
-    """
+    # YT-DLP Command with Internal FFmpeg Fixes
+    # --downloader aria2c (agar server pe aria2 hai toh aur fast hoga, nahi toh default bhi chalega)
     command = [
-        'ffmpeg', '-hide_banner', '-loglevel', 'error',
-        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+        'yt-dlp',
+        '--quiet', '--no-warnings',
         '-i', url,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',  # Max speed
-        '-crf', '26',            # Fast compression
-        '-pix_fmt', 'yuv420p',   # Standard TG format
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-movflags', '+faststart',
-        '-threads', '0',         # Use all CPU cores
-        output_path,
-        '-y'
+        '-o', output_path,
+        # Ye part video corruption fix karega:
+        '--recode-video', 'mp4',
+        '--postprocessor-args', 
+        'ffmpeg:-c:v libx264 -preset ultrafast -crf 26 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart'
     ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    await process.wait()
-    return os.path.exists(output_path)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # 15 minutes timeout
+        await asyncio.wait_for(process.wait(), timeout=900)
+        
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        print(f"YT-DLP Error: {e}")
+        return False
