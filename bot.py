@@ -1,81 +1,114 @@
 import os
 import asyncio
-from pyrogram import Client, filters
-from dotenv import load_dotenv
-from database import db
-from encoder import encode_m3u8
+import time
+import subprocess
+from pyrogram import Client, filters, enums
+from config import API_ID, API_HASH, BOT_TOKEN
+from utils.progress import progress_for_pyrogram
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
 
-load_dotenv()
+bot = Client("FastUploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Limit concurrent processing to prevent CPU overload
-semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_TASKS", 3)))
+# --- HELPERS FOR METADATA ---
+def get_metadata(file_path):
+    metadata = extractMetadata(createParser(file_path))
+    if not metadata:
+        return 0, 0, 0
+    duration = metadata.get('duration').seconds if metadata.has('duration') else 0
+    width = metadata.get('width') if metadata.has('width') else 0
+    height = metadata.get('height') if metadata.has('height') else 0
+    return duration, width, height
 
-app = Client(
-    "m3u8_bot",
-    api_id=int(os.getenv("API_ID")),
-    api_hash=os.getenv("API_HASH"),
-    bot_token=os.getenv("BOT_TOKEN")
-)
+# --- SPLIT LOGIC ---
+async def split_video(file_path, target_size_gb=1.9):
+    file_size = os.path.getsize(file_path)
+    target_size = target_size_gb * 1024 * 1024 * 1024
+    if file_size <= target_size:
+        return [file_path]
 
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await db.add_user(message.from_user.id, message.from_user.username or "User")
-    await message.reply("🚀 **Ultra-Fast M3U8 to MP4 Bot**\n\nSend me any .m3u8 link. I will handle large files by splitting them if they exceed 2GB!")
+    parts = []
+    duration, _, _ = get_metadata(file_path)
+    num_parts = int(file_size // target_size) + 1
+    part_duration = duration // num_parts
 
-@app.on_message(filters.text & filters.private)
-async def handle_link(client, message):
-    url = message.text.strip()
+    base_name, extension = os.path.splitext(file_path)
     
-    # Check if link is valid
-    if "m3u8" not in url and not url.startswith("http"):
-        return
+    for i in range(num_parts):
+        start_time = i * part_duration
+        part_name = f"{base_name}_part{i+1}{extension}"
+        # FFmpeg split command (Fast -c copy)
+        cmd = [
+            "ffmpeg", "-i", file_path,
+            "-ss", str(start_time),
+            "-t", str(part_duration),
+            "-c", "copy", "-map", "0",
+            part_name
+        ]
+        subprocess.run(cmd, capture_output=True)
+        parts.append(part_name)
+    
+    return parts
 
-    async with semaphore:
-        status = await message.reply("⚡ **Initializing...** Connecting to server.")
-        file_path = f"video_{message.from_user.id}_{message.id}.mp4"
+@bot.on_message(filters.regex(r'.*?\.m3u8') & filters.private)
+async def fast_m3u8_uploader(client, message):
+    user_id = message.from_user.id
+    url = message.text.strip()
+    smsg = await message.reply_text("🚀 **Initializing High-Speed Engine...**")
+    
+    timestamp = int(time.time())
+    output_name = f"vid_{user_id}_{timestamp}.mp4"
+    thumb_name = f"th_{user_id}_{timestamp}.jpg"
 
-        try:
-            # Ab encoder.py se hume list of parts milegi
-            video_parts = await encode_m3u8(url, file_path, status)
+    try:
+        # STEP 1: DOWNLOAD
+        await smsg.edit("📥 **Downloading (Parallel Mode)...**")
+        download_cmd = ["yt-dlp", "--hls-prefer-native", "--concurrent-fragments", "10", "-o", output_name, "--merge-output-format", "mp4", url]
+        process = await asyncio.create_subprocess_exec(*download_cmd)
+        await process.wait()
+
+        if not os.path.exists(output_name):
+            return await smsg.edit("❌ **Download Failed!**")
+
+        # STEP 2: SPLIT CHECK
+        await smsg.edit("✂️ **Checking file size & Splitting if needed...**")
+        video_files = await split_video(output_name)
+
+        # STEP 3: PROCESS EACH PART
+        for index, file in enumerate(video_files):
+            part_info = f" (Part {index+1})" if len(video_files) > 1 else ""
+            await smsg.edit(f"🖼 **Generating Metadata {part_info}...**")
             
-            if video_parts and isinstance(video_parts, list):
-                total_parts = len(video_parts)
-                await status.edit(f"🚀 **Download Complete!** Found {total_parts} part(s).\nUploading to Telegram...")
-                
-                for index, part in enumerate(video_parts):
-                    if total_parts > 1:
-                        caption = f"📦 **Part {index + 1} of {total_parts}**\n\n🎬 `{os.path.basename(part)}`"
-                    else:
-                        caption = f"✅ **Downloaded Successfully!**\n\n🎬 `{os.path.basename(part)}`"
+            # Auto Thumb from each part
+            part_thumb = f"thumb_{index}_{timestamp}.jpg"
+            subprocess.run(["ffmpeg", "-ss", "00:00:05", "-i", file, "-vframes", "1", part_thumb])
+            
+            duration, width, height = get_metadata(file)
 
-                    # Uploading part
-                    await message.reply_video(
-                        video=part,
-                        caption=caption,
-                        supports_streaming=True
-                    )
-                    
-                    # Upload ke baad part file delete karein (agar wo split part hai)
-                    if part != file_path and os.path.exists(part):
-                        os.remove(part)
-                
-                await status.delete()
-            else:
-                await status.edit("❌ **Processing Failed!**\n\nReason: Possible expired link or server issue.")
+            await smsg.edit(f"📤 **Uploading {part_info}...**")
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=file,
+                caption=f"✅ **Video Uploaded**{part_info}\n🚀 *Fast Engine*",
+                thumb=part_thumb if os.path.exists(part_thumb) else None,
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                progress=progress_for_pyrogram,
+                progress_args=(f"📤 **Uploading{part_info}...**", smsg, time.time())
+            )
+            
+            # Part cleanup
+            if os.path.exists(part_thumb): os.remove(part_thumb)
+            if len(video_files) > 1 and os.path.exists(file): os.remove(file)
 
-        except Exception as e:
-            if status:
-                await status.edit(f"❌ **Error:** `{str(e)}`")
-        
-        finally:
-            # Original file aur bache hue parts delete karna
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-            # Extra safety: Clean up any remaining parts in the directory if needed
+    except Exception as e:
+        await smsg.edit(f"❌ **Error:** `{e}`")
 
-if __name__ == "__main__":
-    print("🚀 Bot is starting...")
-    app.run()
+    finally:
+        # FINAL CLEANUP
+        if os.path.exists(output_name): os.remove(output_name)
+        await smsg.delete()
+
+bot.run()
