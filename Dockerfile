@@ -1,26 +1,22 @@
-# Use a lightweight Python image
+# Base image: Lightweight Python
 FROM python:3.10-slim
 
-# 1. Install FFmpeg and system dependencies
-# We combine these to keep the image size small
+# System dependencies: FFmpeg is mandatory for m3u8 and splitting
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    build-essential \
-    && apt-get clean \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Set the working directory inside the container
+# Work directory setup
 WORKDIR /app
 
-# 3. Copy only requirements first (to leverage Docker caching)
+# Copy requirements first (for better caching)
 COPY requirements.txt .
-
-# 4. Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy the rest of your application code
+# Copy the rest of the code
 COPY . .
 
-# 6. Command to run your bot
-# Using -u (unbuffered) ensures logs appear in real-time
-CMD ["python", "-u", "bot.py"]
+# Command to run the bot
+CMD ["python", "bot.py"]
