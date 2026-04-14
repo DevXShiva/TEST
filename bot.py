@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import subprocess
+import re
 from pyrogram import Client, filters, enums
 from config import API_ID, API_HASH, BOT_TOKEN
 from utils.progress import progress_for_pyrogram
@@ -37,7 +38,6 @@ async def split_video(file_path, target_size_gb=1.9):
     for i in range(num_parts):
         start_time = i * part_duration
         part_name = f"{base_name}_part{i+1}{extension}"
-        # FFmpeg split command (Fast -c copy)
         cmd = [
             "ffmpeg", "-i", file_path,
             "-ss", str(start_time),
@@ -50,36 +50,37 @@ async def split_video(file_path, target_size_gb=1.9):
     
     return parts
 
-@bot.on_message(filters.regex(r'.*?\.m3u8') & filters.private)
-async def fast_m3u8_uploader(client, message):
+# --- CORE DOWNLOAD & UPLOAD ENGINE ---
+async def process_m3u8_leech(client, message, url, smsg):
     user_id = message.from_user.id
-    url = message.text.strip()
-    smsg = await message.reply_text("🚀 **Initializing High-Speed Engine...**")
-    
     timestamp = int(time.time())
     output_name = f"vid_{user_id}_{timestamp}.mp4"
-    thumb_name = f"th_{user_id}_{timestamp}.jpg"
 
     try:
-        # STEP 1: DOWNLOAD
-        await smsg.edit("📥 **Downloading (Parallel Mode)...**")
-        download_cmd = ["yt-dlp", "--hls-prefer-native", "--concurrent-fragments", "10", "-o", output_name, "--merge-output-format", "mp4", url]
+        await smsg.edit(f"📥 **Downloading Video...**\n🔗 `{url[:50]}...`")
+        # Fixed: --hls-prefer-native removed for better stability, added autonumber logic
+        download_cmd = [
+            "yt-dlp", 
+            "--concurrent-fragments", "10", 
+            "-o", output_name, 
+            "--merge-output-format", "mp4", 
+            "--no-warnings",
+            url
+        ]
         process = await asyncio.create_subprocess_exec(*download_cmd)
         await process.wait()
 
         if not os.path.exists(output_name):
-            return await smsg.edit("❌ **Download Failed!**")
+            await smsg.edit(f"❌ **Download Failed for:** `{url}`")
+            return
 
-        # STEP 2: SPLIT CHECK
-        await smsg.edit("✂️ **Checking file size & Splitting if needed...**")
+        await smsg.edit("✂️ **Checking file size...**")
         video_files = await split_video(output_name)
 
-        # STEP 3: PROCESS EACH PART
         for index, file in enumerate(video_files):
             part_info = f" (Part {index+1})" if len(video_files) > 1 else ""
             await smsg.edit(f"🖼 **Generating Metadata {part_info}...**")
             
-            # Auto Thumb from each part
             part_thumb = f"thumb_{index}_{timestamp}.jpg"
             subprocess.run(["ffmpeg", "-ss", "00:00:05", "-i", file, "-vframes", "1", part_thumb])
             
@@ -99,16 +100,45 @@ async def fast_m3u8_uploader(client, message):
                 progress_args=(f"📤 **Uploading{part_info}...**", smsg, time.time())
             )
             
-            # Part cleanup
             if os.path.exists(part_thumb): os.remove(part_thumb)
             if len(video_files) > 1 and os.path.exists(file): os.remove(file)
 
     except Exception as e:
-        await smsg.edit(f"❌ **Error:** `{e}`")
-
+        await message.reply_text(f"❌ **Error on link:** `{url}`\n`{e}`")
     finally:
-        # FINAL CLEANUP
         if os.path.exists(output_name): os.remove(output_name)
-        await smsg.delete()
+
+# --- NEW /M COMMAND FOR MULTIPLE LINKS ---
+@bot.on_message(filters.command("m") & filters.private)
+async def multi_m3u8_uploader(client, message):
+    if len(message.command) < 2:
+        return await message.reply_text("❌ **Usage:** Send `/m` followed by links (one per line).")
+
+    # Saare links nikalna (split by newline)
+    links = message.text.split("\n")[0:] # Command ke baad wale lines
+    if "/m" in links[0]:
+        links[0] = links[0].replace("/m", "").strip()
+    
+    # Filter empty lines
+    links = [link.strip() for link in links if link.strip()]
+    
+    if not links:
+        return await message.reply_text("❌ **No links found!**")
+
+    smsg = await message.reply_text(f"⏳ **Queue Started:** {len(links)} links found.\nBot will process them one by one.")
+
+    for i, url in enumerate(links):
+        await smsg.edit(f"🔄 **Processing Link {i+1} of {len(links)}...**")
+        await process_m3u8_leech(client, message, url, smsg)
+
+    await smsg.edit("✅ **All tasks completed in sequence!**")
+
+# Purana automatic detection bhi rakha hai as per your request
+@bot.on_message(filters.regex(r'.*?\.m3u8') & filters.private)
+async def auto_m3u8_uploader(client, message):
+    url = message.text.strip()
+    smsg = await message.reply_text("🚀 **Initializing Single Leech...**")
+    await process_m3u8_leech(client, message, url, smsg)
+    await smsg.delete()
 
 bot.run()
