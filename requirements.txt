@@ -3,3 +3,5 @@ tgcrypto
 yt-dlp
 hachoir
 requests
+flask
+aiohttp
