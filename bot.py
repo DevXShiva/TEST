@@ -3,12 +3,27 @@ import asyncio
 import time
 import subprocess
 import re
+from flask import Flask
+from threading import Thread
 from pyrogram import Client, filters, enums
 from config import API_ID, API_HASH, BOT_TOKEN
 from utils.progress import progress_for_pyrogram
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
+# --- FLASK SERVER FOR DEPLOYMENT ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is Running Live!"
+
+def run_flask():
+    # Render automatically sets a PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# --- BOT INITIALIZATION ---
 bot = Client("FastUploader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- HELPERS FOR METADATA ---
@@ -58,7 +73,6 @@ async def process_m3u8_leech(client, message, url, smsg):
 
     try:
         await smsg.edit(f"📥 **Downloading Video...**\n🔗 `{url[:50]}...`")
-        # Fixed: --hls-prefer-native removed for better stability, added autonumber logic
         download_cmd = [
             "yt-dlp", 
             "--concurrent-fragments", "10", 
@@ -114,12 +128,10 @@ async def multi_m3u8_uploader(client, message):
     if len(message.command) < 2:
         return await message.reply_text("❌ **Usage:** Send `/m` followed by links (one per line).")
 
-    # Saare links nikalna (split by newline)
-    links = message.text.split("\n")[0:] # Command ke baad wale lines
+    links = message.text.split("\n")[0:] 
     if "/m" in links[0]:
         links[0] = links[0].replace("/m", "").strip()
     
-    # Filter empty lines
     links = [link.strip() for link in links if link.strip()]
     
     if not links:
@@ -133,7 +145,7 @@ async def multi_m3u8_uploader(client, message):
 
     await smsg.edit("✅ **All tasks completed in sequence!**")
 
-# Purana automatic detection bhi rakha hai as per your request
+# Purana automatic detection
 @bot.on_message(filters.regex(r'.*?\.m3u8') & filters.private)
 async def auto_m3u8_uploader(client, message):
     url = message.text.strip()
@@ -141,4 +153,9 @@ async def auto_m3u8_uploader(client, message):
     await process_m3u8_leech(client, message, url, smsg)
     await smsg.delete()
 
-bot.run()
+# --- MAIN RUN BLOCK ---
+if __name__ == "__main__":
+    # Start Flask in a separate thread
+    Thread(target=run_flask).start()
+    # Run the bot
+    bot.run()
