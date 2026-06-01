@@ -2,13 +2,13 @@ import os
 import asyncio
 import time
 import subprocess
+import json
+import shutil
 from flask import Flask
 from threading import Thread
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from utils.progress import progress_for_pyrogram
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
 
 # --- FLASK SERVER FOR DEPLOYMENT ---
 app = Flask(__name__)
@@ -18,7 +18,6 @@ def home():
     return "Bot is Running Live!"
 
 def run_flask():
-    # Render automatically sets a PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -30,21 +29,45 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# --- HELPERS FOR METADATA ---
-def get_metadata(file_path):
-    metadata = extractMetadata(createParser(file_path))
+# Global Download Queue
+download_queue = asyncio.Queue()
 
-    if not metadata:
+# --- HELPERS ---
+
+def get_metadata(file_path):
+    """Extracts duration, width, and height using ffprobe."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        
+        duration = int(float(data.get("format", {}).get("duration", 0)))
+        width, height = 0, 0
+        
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                width = stream.get("width", 0)
+                height = stream.get("height", 0)
+                break
+        return duration, width, height
+    except Exception as e:
+        print(f"Metadata Error: {e}")
         return 0, 0, 0
 
-    duration = metadata.get('duration').seconds if metadata.has('duration') else 0
-    width = metadata.get('width') if metadata.has('width') else 0
-    height = metadata.get('height') if metadata.has('height') else 0
+def parse_name(text):
+    """Extracts custom name after -n flag."""
+    if "-n" not in text:
+        return None
+    try:
+        return text.split("-n", 1)[1].strip()
+    except:
+        return None
 
-    return duration, width, height
-
-# --- VIDEO SPLIT LOGIC ---
 async def split_video(file_path, target_size_gb=1.9):
+    """Splits video into parts if it exceeds the target size."""
     file_size = os.path.getsize(file_path)
     target_size = target_size_gb * 1024 * 1024 * 1024
 
@@ -52,266 +75,184 @@ async def split_video(file_path, target_size_gb=1.9):
         return [file_path]
 
     parts = []
-
     duration, _, _ = get_metadata(file_path)
-
     num_parts = int(file_size // target_size) + 1
     part_duration = duration // num_parts
-
     base_name, extension = os.path.splitext(file_path)
 
     for i in range(num_parts):
         start_time = i * part_duration
-
         part_name = f"{base_name}_part{i+1}{extension}"
-
         cmd = [
-            "ffmpeg",
+            "ffmpeg", "-y", "-loglevel", "error",
             "-i", file_path,
             "-ss", str(start_time),
             "-t", str(part_duration),
-            "-c", "copy",
-            "-map", "0",
+            "-c", "copy", "-map", "0",
+            "-avoid_negative_ts", "make_zero",
             part_name
         ]
-
-        subprocess.run(cmd, capture_output=True)
-
+        subprocess.run(cmd)
         parts.append(part_name)
-
     return parts
 
-# --- CORE DOWNLOAD & UPLOAD ENGINE ---
-async def process_m3u8_leech(client, message, url, smsg):
+# --- CORE ENGINE ---
+
+async def process_m3u8_leech(client, message, url, smsg, custom_title=None):
     user_id = message.from_user.id
     timestamp = int(time.time())
-
     output_name = f"vid_{user_id}_{timestamp}.mp4"
+    encoded_file = f"enc_{user_id}_{timestamp}.mp4"
 
     try:
-        await smsg.edit(
-            f"📥 **Downloading Video...**\n\n🔗 `{url[:70]}...`"
-        )
-
+        # 1. DOWNLOAD
+        await smsg.edit(f"📥 **Downloading Highest Quality...**\n`{url[:50]}...`")
         download_cmd = [
-            "yt-dlp",
+            "yt-dlp", "-f", "bv*+ba/b",
             "--concurrent-fragments", "10",
-            "-o", output_name,
             "--merge-output-format", "mp4",
-            "--no-warnings",
-            url
+            "--no-warnings", "-o", output_name, url
         ]
-
         process = await asyncio.create_subprocess_exec(*download_cmd)
-
         await process.wait()
 
         if not os.path.exists(output_name):
-            await smsg.edit(f"❌ **Download Failed**\n\n🔗 `{url}`")
+            await smsg.edit("❌ **Download Failed.**")
             return
 
-        await smsg.edit("✂️ **Checking file size & splitting if needed...**")
+        # 2. ENCODE TO X265
+        await smsg.edit("🎞 **Encoding to H.265 (x265)...**\n*This may take time.*")
+        encode_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", output_name,
+            "-c:v", "libx265", "-preset", "slow", "-crf", "18",
+            "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart"
+        ]
+        if custom_title:
+            encode_cmd.extend(["-metadata", f"title={custom_title}"])
+        
+        encode_cmd.append(encoded_file)
+        
+        process = await asyncio.create_subprocess_exec(*encode_cmd)
+        await process.wait()
 
-        video_files = await split_video(output_name)
+        # 3. SPLIT (If needed)
+        await smsg.edit("✂️ **Checking file size & splitting...**")
+        video_files = await split_video(encoded_file)
 
+        # 4. UPLOAD PARTS
         for index, file in enumerate(video_files):
-
             part_info = f" (Part {index+1})" if len(video_files) > 1 else ""
+            
+            # Use custom title for file display name if provided
+            upload_display_name = f"{custom_title}{part_info}.mp4" if custom_title else os.path.basename(file)
+            temp_upload_file = os.path.join(os.path.dirname(file), upload_display_name)
+            shutil.copy(file, temp_upload_file)
 
-            await smsg.edit(f"🖼 **Generating Thumbnail & Metadata{part_info}...**")
-
+            # Thumbnail
             part_thumb = f"thumb_{index}_{timestamp}.jpg"
-
             subprocess.run([
-                "ffmpeg",
-                "-ss", "00:00:05",
-                "-i", file,
-                "-vframes", "1",
-                part_thumb
+                "ffmpeg", "-y", "-loglevel", "error", "-ss", "00:00:15",
+                "-i", temp_upload_file, "-frames:v", "1", "-q:v", "2", part_thumb
             ])
 
-            duration, width, height = get_metadata(file)
-
-            await smsg.edit(f"📤 **Uploading Video{part_info}...**")
+            duration, width, height = get_metadata(temp_upload_file)
 
             await client.send_video(
                 chat_id=message.chat.id,
-                video=file,
-                caption=(
-                    f"✅ **Video Uploaded Successfully**{part_info}\n\n"
-                    f"🚀 Powered by FastUploader Bot"
-                ),
+                video=temp_upload_file,
+                caption=f"🎬 **{custom_title or 'Video'}**{part_info}\n\n✅ Uploaded Successfully",
                 thumb=part_thumb if os.path.exists(part_thumb) else None,
-                duration=duration,
-                width=width,
-                height=height,
+                duration=duration, width=width, height=height,
                 supports_streaming=True,
                 progress=progress_for_pyrogram,
-                progress_args=(
-                    f"📤 **Uploading{part_info}...**",
-                    smsg,
-                    time.time()
-                )
+                progress_args=(f"📤 **Uploading{part_info}...**", smsg, time.time())
             )
 
-            # CLEANUP
-            if os.path.exists(part_thumb):
-                os.remove(part_thumb)
-
-            if len(video_files) > 1 and os.path.exists(file):
-                os.remove(file)
+            # Cleanup loop files
+            for f in [part_thumb, temp_upload_file]:
+                if os.path.exists(f): os.remove(f)
+            if len(video_files) > 1 and os.path.exists(file): os.remove(file)
 
     except Exception as e:
-        await message.reply_text(
-            f"❌ **Error Processing Link**\n\n🔗 `{url}`\n\n`{e}`"
-        )
-
+        await message.reply_text(f"❌ **Error:**\n`{e}`")
     finally:
-        if os.path.exists(output_name):
-            os.remove(output_name)
+        for f in [output_name, encoded_file]:
+            if os.path.exists(f): os.remove(f)
 
-# --- START COMMAND ---
+# --- QUEUE WORKER ---
+
+async def queue_worker():
+    while True:
+        client, message, url, smsg, custom_title = await download_queue.get()
+        try:
+            await process_m3u8_leech(client, message, url, smsg, custom_title)
+        except Exception as e:
+            print(f"Queue Error: {e}")
+        finally:
+            await smsg.delete()
+            download_queue.task_done()
+
+# --- COMMAND HANDLERS ---
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
+    await message.reply_text(
+        "🚀 **FastUploader H.265 Bot**\n\n"
+        "**Usage:**\n"
+        "1. Send an M3U8 link directly.\n"
+        "2. `/l -n Title <link>` or reply to a link with `/l -n Title`.\n"
+        "3. `/m <links>` for batch processing.\n\n"
+        "All videos encoded to **x265 HEVC**."
+    )
 
-    welcome_text = """
-🚀 **Welcome to FastUploader Bot**
+@bot.on_message(filters.command("l") & filters.private)
+async def leech_command(client, message):
+    custom_title = parse_name(message.text)
+    url = None
+    
+    if message.reply_to_message:
+        url = message.reply_to_message.text.strip()
+    else:
+        parts = message.text.split()
+        for item in parts:
+            if item.startswith("http"):
+                url = item
+                break
 
-⚡ Advanced M3U8 Video Downloader & Telegram Uploader
+    if not url:
+        return await message.reply_text("❌ Reply to a link or include one in the command.")
 
-━━━━━━━━━━━━━━━━━━
-🎯 **What This Bot Can Do**
-━━━━━━━━━━━━━━━━━━
+    smsg = await message.reply_text(f"⏳ Added to Queue. Position: {download_queue.qsize() + 1}")
+    await download_queue.put((client, message, url, smsg, custom_title))
 
-✅ Download `.m3u8` videos instantly  
-✅ Upload videos directly to Telegram  
-✅ Auto split large files (>2GB)  
-✅ Generate thumbnails automatically  
-✅ Extract video metadata automatically  
-✅ Fast upload with live progress updates  
-✅ Supports multiple links queue system  
-
-━━━━━━━━━━━━━━━━━━
-📌 **Available Commands**
-━━━━━━━━━━━━━━━━━━
-
-🔹 `/start`
-Show bot help & information.
-
-🔹 `/m`
-Download multiple M3U8 links sequentially.
-
-━━━━━━━━━━━━━━━━━━
-📥 **How To Use**
-━━━━━━━━━━━━━━━━━━
-
-✅ **Single Link Download**
-
-Just send any `.m3u8` link directly.
-
-Example:
-`https://example.com/video.m3u8`
-
-━━━━━━━━━━━━━━━━━━
-
-✅ **Multiple Links Download**
-
-Send command like this:
-
-`/m
-https://site.com/1.m3u8
-https://site.com/2.m3u8
-https://site.com/3.m3u8`
-
-Bot will automatically process links one by one.
-
-━━━━━━━━━━━━━━━━━━
-⚙️ **Bot Features**
-━━━━━━━━━━━━━━━━━━
-
-🚀 Ultra Fast Downloading  
-📤 Fast Telegram Upload  
-✂️ Auto Video Splitting  
-🖼 Thumbnail Generator  
-📊 Live Upload Progress  
-🎬 Streamable Video Uploads  
-🔄 Queue Processing System  
-
-━━━━━━━━━━━━━━━━━━
-
-💎 Developed for High-Speed Media Uploading
-"""
-
-    await message.reply_text(welcome_text)
-
-# --- MULTIPLE LINKS COMMAND ---
 @bot.on_message(filters.command("m") & filters.private)
 async def multi_m3u8_uploader(client, message):
-
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "❌ **Usage:**\n\nSend `/m` followed by links (one per line)."
-        )
-
-    links = message.text.split("\n")[0:]
-
-    if "/m" in links[0]:
-        links[0] = links[0].replace("/m", "").strip()
-
-    links = [link.strip() for link in links if link.strip()]
-
+    lines = message.text.split("\n")
+    links = [l.strip() for l in lines if "http" in l]
+    
     if not links:
-        return await message.reply_text("❌ **No links found!**")
+        return await message.reply_text("❌ No links found.")
 
-    smsg = await message.reply_text(
-        f"⏳ **Queue Started**\n\n"
-        f"📦 Total Links: `{len(links)}`\n"
-        f"🔄 Processing sequentially..."
-    )
+    for url in links:
+        smsg = await message.reply_text(f"⏳ Added to Queue. Position: {download_queue.qsize() + 1}")
+        await download_queue.put((client, message, url, smsg, None))
 
-    for i, url in enumerate(links):
-
-        await smsg.edit(
-            f"🔄 **Processing Link {i+1} of {len(links)}**"
-        )
-
-        await process_m3u8_leech(
-            client,
-            message,
-            url,
-            smsg
-        )
-
-    await smsg.edit(
-        "✅ **All Tasks Completed Successfully!**"
-    )
-
-# --- AUTO M3U8 DETECTION ---
-@bot.on_message(filters.regex(r'.*?\.m3u8') & filters.private)
-async def auto_m3u8_uploader(client, message):
-
+@bot.on_message(filters.private & filters.text & ~filters.command(["start", "m", "l"]))
+async def auto_link_handler(client, message):
+    if "m3u8" not in message.text.lower() and "http" not in message.text.lower():
+        return
+    
     url = message.text.strip()
+    smsg = await message.reply_text(f"⏳ Added to Queue. Position: {download_queue.qsize() + 1}")
+    await download_queue.put((client, message, url, smsg, None))
 
-    smsg = await message.reply_text(
-        "🚀 **Initializing Download Engine...**"
-    )
+# --- MAIN START ---
 
-    await process_m3u8_leech(
-        client,
-        message,
-        url,
-        smsg
-    )
-
-    await smsg.delete()
-
-# --- MAIN RUN BLOCK ---
 if __name__ == "__main__":
-
-    # Start Flask Server
     Thread(target=run_flask).start()
-
-    # Start Telegram Bot
-    print("🚀 Bot Started Successfully!")
-
+    bot.loop.create_task(queue_worker())
+    print("🚀 Bot and Queue Worker Started!")
     bot.run()
